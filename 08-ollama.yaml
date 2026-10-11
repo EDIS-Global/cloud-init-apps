@@ -80,18 +80,56 @@ write_files:
     }
 
     wait_for_clock() {
-      # ConfigDrive often boots with year 1970; HTTPS/apt then fail.
+      # ConfigDrive VMs often boot at 1970; TLS cert checks then break apt/docker.
+      echo "Boot clock: $(date -u)"
       timedatectl set-ntp true 2>/dev/null || true
       systemctl start systemd-timesyncd 2>/dev/null || systemctl start chrony 2>/dev/null || true
-      for _ in $(seq 1 90); do
+
+      set_clock_from_http() {
+        local host="$1" path="${2:-/}"
+        command -v python3 >/dev/null 2>&1 || return 1
+        python3 - "$host" "$path" <<'PYCLOCK'
+    import re, socket, subprocess, sys
+    from email.utils import parsedate_to_datetime
+    host, path = sys.argv[1], sys.argv[2]
+    sock = socket.create_connection((host, 80), timeout=8)
+    req = "HEAD {} HTTP/1.0\r\nHost: {}\r\n\r\n".format(path, host)
+    sock.sendall(req.encode("ascii"))
+    data = b""
+    while True:
+        buf = sock.recv(4096)
+        if not buf:
+            break
+        data += buf
+        if len(data) > 16384:
+            break
+    sock.close()
+    text = data.decode("latin1", "replace")
+    match = re.search(r"(?im)^date:\s*(.+)$", text)
+    if not match:
+        sys.exit(1)
+    stamp = parsedate_to_datetime(match.group(1).strip()).strftime("%Y-%m-%d %H:%M:%S UTC")
+    subprocess.check_call(["date", "-u", "-s", stamp])
+    print(stamp)
+    PYCLOCK
+      }
+
+      local year
+      for _ in $(seq 1 30); do
         year="$(date -u +%Y)"
         if [[ "$year" =~ ^[0-9]+$ ]] && (( year >= 2024 )); then
           echo "System clock OK: $(date -u)"
           return 0
         fi
+        if set_clock_from_http deb.debian.org / \
+          || set_clock_from_http 1.1.1.1 / \
+          || set_clock_from_http google.com /; then
+          echo "Set clock via HTTP Date: $(date -u)"
+        fi
         sleep 2
       done
-      echo "WARNING: system clock still wrong ($(date -u)); package/HTTPS installs may fail" >&2
+      echo "ERROR: system clock still wrong ($(date -u)); refusing apt/HTTPS installs" >&2
+      return 1
     }
 
     assert_debian13

@@ -80,18 +80,56 @@ write_files:
     }
 
     wait_for_clock() {
-      # ConfigDrive often boots with year 1970; HTTPS/apt then fail.
+      # ConfigDrive VMs often boot at 1970; TLS cert checks then break apt/docker.
+      echo "Boot clock: $(date -u)"
       timedatectl set-ntp true 2>/dev/null || true
       systemctl start systemd-timesyncd 2>/dev/null || systemctl start chrony 2>/dev/null || true
-      for _ in $(seq 1 90); do
+
+      set_clock_from_http() {
+        local host="$1" path="${2:-/}"
+        command -v python3 >/dev/null 2>&1 || return 1
+        python3 - "$host" "$path" <<'PYCLOCK'
+    import re, socket, subprocess, sys
+    from email.utils import parsedate_to_datetime
+    host, path = sys.argv[1], sys.argv[2]
+    sock = socket.create_connection((host, 80), timeout=8)
+    req = "HEAD {} HTTP/1.0\r\nHost: {}\r\n\r\n".format(path, host)
+    sock.sendall(req.encode("ascii"))
+    data = b""
+    while True:
+        buf = sock.recv(4096)
+        if not buf:
+            break
+        data += buf
+        if len(data) > 16384:
+            break
+    sock.close()
+    text = data.decode("latin1", "replace")
+    match = re.search(r"(?im)^date:\s*(.+)$", text)
+    if not match:
+        sys.exit(1)
+    stamp = parsedate_to_datetime(match.group(1).strip()).strftime("%Y-%m-%d %H:%M:%S UTC")
+    subprocess.check_call(["date", "-u", "-s", stamp])
+    print(stamp)
+    PYCLOCK
+      }
+
+      local year
+      for _ in $(seq 1 30); do
         year="$(date -u +%Y)"
         if [[ "$year" =~ ^[0-9]+$ ]] && (( year >= 2024 )); then
           echo "System clock OK: $(date -u)"
           return 0
         fi
+        if set_clock_from_http deb.debian.org / \
+          || set_clock_from_http 1.1.1.1 / \
+          || set_clock_from_http google.com /; then
+          echo "Set clock via HTTP Date: $(date -u)"
+        fi
         sleep 2
       done
-      echo "WARNING: system clock still wrong ($(date -u)); package/HTTPS installs may fail" >&2
+      echo "ERROR: system clock still wrong ($(date -u)); refusing apt/HTTPS installs" >&2
+      return 1
     }
 
     assert_debian13
@@ -103,25 +141,32 @@ write_files:
     
     # Internet testing: gateway port left open after openclaw-setup (no DOCKER-USER DROP).
     mkdir -p "$ROOT/config" "$ROOT/workspace" "$ROOT/auth-profile-secrets"
+    # GitHub tags look like v2026.10.1; container tags are usually without the leading v.
+    RELEASE="$(curl -fsSL https://api.github.com/repos/openclaw/openclaw/releases/latest | jq -r '.tag_name // empty')"
+    [[ -n "$RELEASE" ]] || { echo 'Cannot determine OpenClaw release tag' >&2; exit 1; }
+    IMAGE_TAG="${RELEASE#v}"
+    echo "$RELEASE" > "$ROOT/UPSTREAM_RELEASE"
+    echo "$IMAGE_TAG" > "$ROOT/IMAGE_TAG"
     if [[ ! -d "$ROOT/source/.git" ]]; then
-      git clone --depth 1 --branch 2026.9.3 https://github.com/openclaw/openclaw.git "$ROOT/source"
+      git clone --depth 1 --branch "$RELEASE" https://github.com/openclaw/openclaw.git "$ROOT/source"
     fi
-    docker pull ghcr.io/openclaw/openclaw:2026.9.3
-    cat >/usr/local/sbin/openclaw-setup <<'BASH'
+    docker pull "ghcr.io/openclaw/openclaw:${IMAGE_TAG}"
+    cat >/usr/local/sbin/openclaw-setup <<BASH
     #!/usr/bin/env bash
     set -Eeuo pipefail
     cd /opt/vps-apps/02-openclaw/source
-    export OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.9.3
+    export OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:${IMAGE_TAG}
     export OPENCLAW_CONFIG_DIR=/opt/vps-apps/02-openclaw/config
     export OPENCLAW_WORKSPACE_DIR=/opt/vps-apps/02-openclaw/workspace
     export OPENCLAW_AUTH_PROFILE_SECRET_DIR=/opt/vps-apps/02-openclaw/auth-profile-secrets
     ./scripts/docker/setup.sh
     BASH
     chmod 0750 /usr/local/sbin/openclaw-setup
-    cat >/usr/local/sbin/vps-app-test <<'BASH'
+    cat >/usr/local/sbin/vps-app-test <<BASH
     #!/usr/bin/env bash
     set -Eeuo pipefail
-    docker image inspect ghcr.io/openclaw/openclaw:2026.9.3 >/dev/null
+    IMAGE_TAG="\$(cat /opt/vps-apps/02-openclaw/IMAGE_TAG)"
+    docker image inspect "ghcr.io/openclaw/openclaw:\${IMAGE_TAG}" >/dev/null
     if docker ps --format '{{.Names}}' | grep -q openclaw; then
       docker ps --filter name=openclaw
     else
@@ -130,7 +175,7 @@ write_files:
     BASH
     chmod 0750 /usr/local/sbin/vps-app-test
     
-    echo "Staged, NOT RUNNING: run sudo openclaw-setup interactively over SSH"
+    echo "Staged release $RELEASE (image $IMAGE_TAG). NOT RUNNING: run sudo openclaw-setup interactively over SSH"
     touch "$ROOT/.bootstrap-complete"
     echo "FINISHED: $APP (see $ROOT)"
 runcmd:
