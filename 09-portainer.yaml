@@ -7,8 +7,10 @@ ssh_pwauth: true
 # CUSTOMER: change root password below before production. Default is for lab/testing only.
 chpasswd:
   expire: false
-  list: |
-    root:VpsApp-ChangeMe!
+  users:
+  - name: root
+    password: VpsApp-ChangeMe!
+    type: text
 users:
 - name: root
   lock_passwd: false
@@ -78,7 +80,24 @@ write_files:
     EOF
       chmod 0750 /usr/local/sbin/vps-app-test
     }
+
+    wait_for_clock() {
+      # ConfigDrive often boots with year 1970; HTTPS/apt then fail.
+      timedatectl set-ntp true 2>/dev/null || true
+      systemctl start systemd-timesyncd 2>/dev/null || systemctl start chrony 2>/dev/null || true
+      for _ in $(seq 1 90); do
+        year="$(date -u +%Y)"
+        if [[ "$year" =~ ^[0-9]+$ ]] && (( year >= 2024 )); then
+          echo "System clock OK: $(date -u)"
+          return 0
+        fi
+        sleep 2
+      done
+      echo "WARNING: system clock still wrong ($(date -u)); package/HTTPS installs may fail" >&2
+    }
+
     assert_debian13
+    wait_for_clock
     if [[ -f "$ROOT/.bootstrap-complete" ]]; then echo "$APP was provisioned already. Inspect $ROOT"; exit 0; fi
     base_packages
     
@@ -106,6 +125,5 @@ write_files:
     touch "$ROOT/.bootstrap-complete"
     echo "FINISHED: $APP (see $ROOT)"
 runcmd:
-- systemctl reload ssh || systemctl reload sshd || true
-- - bash
-  - /usr/local/sbin/vps-app-bootstrap
+- [ bash, -lc, "systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true" ]
+- [ bash, /usr/local/sbin/vps-app-bootstrap ]

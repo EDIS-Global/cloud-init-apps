@@ -31,13 +31,17 @@ Every template sets a **default root password** with cloud-init `chpasswd` so SS
 ```yaml
 chpasswd:
   expire: false
-  list: |
-    root:YOUR-STRONG-PASSWORD-HERE
+  users:
+  - name: root
+    password: YOUR-STRONG-PASSWORD-HERE
+    type: text
 ```
 
 Also enabled: `disable_root: false`, `ssh_pwauth: true`, and `PermitRootLogin yes`.
 
 If Virtualizor also injects a root password, cloud-init `chpasswd` in this user-data wins for that boot — use the password from the YAML (or change the YAML to match what you sell in WHMCS).
+
+Bootstrap waits for a sane system clock (ConfigDrive VMs often boot at `1970` until NTP catches up). Without that, `apt` / Docker HTTPS pulls fail and `cloud-init` shows `runcmd` errors.
 
 ---
 
