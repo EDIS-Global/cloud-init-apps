@@ -4,28 +4,26 @@
 package_update: false
 disable_root: false
 ssh_pwauth: true
-# CUSTOMER: change root password below before production. Default is for lab/testing only.
+# CUSTOMER: change plain_text_passwd below before production. Default is for lab/testing only.
+# Keep the password quoted. Avoid YAML-special characters like ! : # etc.
 chpasswd:
   expire: false
-  users:
-  - name: root
-    password: VpsApp-ChangeMe!
-    type: text
 users:
 - name: root
   lock_passwd: false
+  plain_text_passwd: "VpsApp-ChangeMe-2026"
 write_files:
 - path: /etc/ssh/sshd_config.d/60-vps-provider-root.conf
-  owner: root:root
-  permissions: '0644'
+  owner: "root:root"
+  permissions: "0644"
   content: |
     PermitRootLogin yes
     PasswordAuthentication yes
     KbdInteractiveAuthentication yes
     UsePAM yes
 - path: /usr/local/sbin/vps-app-bootstrap
-  owner: root:root
-  permissions: '0700'
+  owner: "root:root"
+  permissions: "0700"
   content: |
     #!/usr/bin/env bash
     set -Eeuo pipefail

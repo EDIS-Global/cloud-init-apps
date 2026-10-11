@@ -24,17 +24,15 @@ Every template sets a **default root password** with cloud-init `chpasswd` so SS
 | Field | Value |
 |---|---|
 | User | `root` |
-| Default password | `VpsApp-ChangeMe!` |
+| Default password | `VpsApp-ChangeMe-2026` |
 
 **Change it before production / before giving a VPS to a customer.** Near the top of each `NN-*.yaml`:
 
 ```yaml
-chpasswd:
-  expire: false
-  users:
-  - name: root
-    password: YOUR-STRONG-PASSWORD-HERE
-    type: text
+users:
+- name: root
+  lock_passwd: false
+  plain_text_passwd: "YOUR-STRONG-PASSWORD-HERE"
 ```
 
 Also enabled: `disable_root: false`, `ssh_pwauth: true`, and `PermitRootLogin yes`.
