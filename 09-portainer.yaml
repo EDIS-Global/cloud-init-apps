@@ -1,6 +1,6 @@
 #cloud-config
 # Debian 13 (trixie) only. One fresh VPS per application.
-# Portainer CE, loopback-only self-signed HTTPS
+# Portainer CE: HTTP :9000 and HTTPS :9443 (self-signed)
 package_update: false
 disable_root: false
 ssh_pwauth: true
@@ -146,6 +146,7 @@ write_files:
         image: portainer/portainer-ce:lts
         restart: unless-stopped
         ports:
+          - '9000:9000'
           - '9443:9443'
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
@@ -155,7 +156,8 @@ write_files:
     YAML
     docker compose config -q
     docker compose up -d
-    create_test_http 9443 / https
+    # Prefer HTTP :9000 for quick lab access; :9443 remains HTTPS.
+    create_test_http 9000 /
     
     echo "Bootstrap complete."
     touch "$ROOT/.bootstrap-complete"

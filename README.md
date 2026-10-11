@@ -47,7 +47,7 @@ Bootstrap waits for a sane system clock (ConfigDrive VMs often boot at `1970` un
 
 | Mode | When to use | How customers reach the app |
 |---|---|---|
-| **A. IP ready (default in these files)** | Fast lab / first boot tests | `http://VPS_IP:PORT` (Portainer uses HTTPS on `:9443`) |
+| **A. IP ready (default in these files)** | Fast lab / first boot tests | `http://VPS_IP:PORT` (Portainer also has HTTPS on `:9443`) |
 | **B. Domain + HTTPS (recommended for customers)** | Selling / production-like use | `https://app.example.com` via reverse proxy (Caddy or nginx) |
 | **C. Interactive agents** | OpenClaw, Hermes | SSH in, run setup, then use IP or domain |
 
@@ -67,9 +67,9 @@ Current templates ship in **Mode A**: app ports are published on all interfaces 
 | `06-hermes-agent.yaml` | Hermes Agent | After `sudo hermes-setup` | — | No web UI (outbound messaging) | 1/2G/15G → 2/4G/30G |
 | `07-woocommerce.yaml` | WooCommerce | Yes (activate plugin) | `8080` | `http://VPS_IP:8080` | 2/4G/25G → 4/8G/50G |
 | `08-ollama.yaml` | Ollama | Yes (tiny CPU model) | `11434` | `http://VPS_IP:11434/api/tags` | 2/4G/20G → 4/8G/50G |
-| `09-portainer.yaml` | Portainer CE | Yes | `9443` | `https://VPS_IP:9443` | 1/2G/15G → 2/4G/30G |
+| `09-portainer.yaml` | Portainer CE | Yes | `9000` (HTTP), `9443` (HTTPS) | `http://VPS_IP:9000` or `https://VPS_IP:9443` | 1/2G/15G → 2/4G/30G |
 | `10-chatwoot.yaml` | Chatwoot CE | Yes (no SMTP by default) | `3000` | `http://VPS_IP:3000` | 4/4G/30G → 4/8G/50G |
-| `11-dify.yaml` | Dify | Yes (multi-container warmup) | `8080` / `8443` | `http://VPS_IP:8080/install` | 2/4G/30G → 4/8G/60G |
+| `11-dify.yaml` | Dify | Yes (multi-container warmup) | `8080` (HTTP), `8443` (HTTPS self-signed) | `http://VPS_IP:8080/install` or `https://VPS_IP:8443/install` | 2/4G/30G → 4/8G/60G |
 | `12-odoo.yaml` | Odoo 19 | Yes (create DB) | `8069` | `http://VPS_IP:8069` | 2/4G/30G → 4/8G/60G |
 
 **Firewall:** open the app port(s) + `22/tcp` on the provider/hypervisor firewall for Mode A. For Mode B, prefer opening only `80/tcp` and `443/tcp` to the world and keep app ports firewalled to localhost after the reverse proxy is in place.
@@ -160,9 +160,9 @@ dig +short n8n.example.com
 | Open WebUI | `ai.example.com` | `127.0.0.1:3000` |
 | WooCommerce | `shop.example.com` | `127.0.0.1:8080` |
 | Ollama | `ollama.example.com` | `127.0.0.1:11434` |
-| Portainer | `portainer.example.com` | `127.0.0.1:9443` (HTTPS upstream) |
+| Portainer | `portainer.example.com` | `127.0.0.1:9000` (HTTP) or `127.0.0.1:9443` (HTTPS upstream) |
 | Chatwoot | `chat.example.com` | `127.0.0.1:3000` |
-| Dify | `dify.example.com` | `127.0.0.1:8080` |
+| Dify | `dify.example.com` | `127.0.0.1:8080` (HTTP) or `127.0.0.1:8443` (HTTPS self-signed) |
 | Odoo | `erp.example.com` | `127.0.0.1:8069` |
 
 One domain per VPS is the simple model (these templates are one-app-per-VPS). If you later host a reverse proxy elsewhere, point the hostname at that proxy instead.
@@ -190,7 +190,15 @@ n8n.example.com {
 }
 ```
 
-Portainer (HTTPS upstream / self-signed):
+Portainer (HTTP upstream on `:9000`, simplest):
+
+```caddy
+portainer.example.com {
+        reverse_proxy 127.0.0.1:9000
+}
+```
+
+Or Portainer HTTPS upstream on `:9443` (self-signed):
 
 ```caddy
 portainer.example.com {
@@ -264,6 +272,9 @@ Then `docker compose up -d` in `/opt/vps-apps/05-open-webui`.
 
 #### Chatwoot — `/opt/vps-apps/10-chatwoot/.env`
 
+Bootstrap sets `FRONTEND_URL=http://<IPv4>:3000` (IPv4 only — bare IPv6 breaks Chatwoot with `URI::InvalidURIError`).  
+For a domain:
+
 ```bash
 FRONTEND_URL=https://chat.example.com
 ```
@@ -271,11 +282,19 @@ FRONTEND_URL=https://chat.example.com
 ```bash
 cd /opt/vps-apps/10-chatwoot
 sudo docker compose up -d
+sudo docker compose restart rails sidekiq
 ```
 
 #### Dify — `/opt/vps-apps/11-dify/source/docker/.env`
 
-Set at least:
+Lab IP access (open provider firewall **8080** and **8443**):
+
+- HTTP: `http://VPS_IP:8080/install`
+- HTTPS: `https://VPS_IP:8443/install` (self-signed cert; accept the browser warning)
+
+Template sets `EXPOSE_NGINX_PORT=8080`, `EXPOSE_NGINX_SSL_PORT=8443`, and `NGINX_HTTPS_ENABLED=true` with a generated `nginx/ssl/dify.crt` + `dify.key`.
+
+For a real domain (preferred in production), set at least:
 
 ```bash
 CONSOLE_API_URL=https://dify.example.com
@@ -304,7 +323,8 @@ sudo grep ODOO_MASTER_PASSWORD /opt/vps-apps/12-odoo/.env
 
 #### Portainer
 
-Visit `https://portainer.example.com` (via Caddy). Create the admin user on first visit.
+Lab IP test: `http://VPS_IP:9000` (or `https://VPS_IP:9443` with the self-signed warning).  
+With a domain/Caddy: `https://portainer.example.com`. Create the admin user on first visit.
 
 #### OpenClaw
 

@@ -1,6 +1,6 @@
 #cloud-config
 # Debian 13 (trixie) only. One fresh VPS per application.
-# Dify official multi-container Compose deployment
+# Dify official multi-container Compose: HTTP :8080 + HTTPS :8443 (self-signed)
 package_update: false
 disable_root: false
 ssh_pwauth: true
@@ -166,6 +166,11 @@ write_files:
       'DIFY_AGENT_SERVER_SECRET_KEY':base64.b64encode(secrets.token_bytes(32)).decode(),
       'EXPOSE_NGINX_PORT':'8080',
       'EXPOSE_NGINX_SSL_PORT':'8443',
+      'NGINX_HTTPS_ENABLED':'true',
+      'NGINX_PORT':'80',
+      'NGINX_SSL_PORT':'443',
+      'NGINX_SSL_CERT_FILENAME':'dify.crt',
+      'NGINX_SSL_CERT_KEY_FILENAME':'dify.key',
     }
     lines=[]
     for line in s.splitlines():
@@ -179,6 +184,15 @@ write_files:
     PY
       chmod 0600 .env
     fi
+    # Self-signed cert so host :8443 actually serves HTTPS (lab use; browsers will warn).
+    mkdir -p nginx/ssl
+    if [[ ! -f nginx/ssl/dify.crt || ! -f nginx/ssl/dify.key ]]; then
+      openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+        -keyout nginx/ssl/dify.key -out nginx/ssl/dify.crt \
+        -subj '/CN=dify.local/O=VPS-Lab/C=US'
+      chmod 0640 nginx/ssl/dify.key
+      chmod 0644 nginx/ssl/dify.crt
+    fi
     docker compose config -q
     docker compose up -d
     cat >/usr/local/sbin/vps-app-test <<'BASH'
@@ -186,11 +200,12 @@ write_files:
     set -Eeuo pipefail
     cd /opt/vps-apps/11-dify/source/docker
     docker compose ps
-    curl -sS --max-time 15 -o /dev/null -w 'Dify HTTP status: %{http_code}\n' http://127.0.0.1:8080/install
+    curl -sS --max-time 15 -o /dev/null -w 'Dify HTTP  :8080 status: %{http_code}\n' http://127.0.0.1:8080/install || true
+    curl -k -sS --max-time 15 -o /dev/null -w 'Dify HTTPS :8443 status: %{http_code}\n' https://127.0.0.1:8443/install || true
     BASH
     chmod 0750 /usr/local/sbin/vps-app-test
     
-    echo "Bootstrap complete."
+    echo "Bootstrap complete. HTTP :8080 and HTTPS :8443 (self-signed)."
     touch "$ROOT/.bootstrap-complete"
     echo "FINISHED: $APP (see $ROOT)"
 runcmd:
