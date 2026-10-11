@@ -1,0 +1,180 @@
+#cloud-config
+# Debian 13 (trixie) only. One fresh VPS per application.
+# Chatwoot CE + PostgreSQL pgvector + Redis + Sidekiq
+package_update: false
+disable_root: false
+ssh_pwauth: true
+# CUSTOMER: change root password below before production. Default is for lab/testing only.
+chpasswd:
+  expire: false
+  list: |
+    root:VpsApp-ChangeMe!
+users:
+- name: root
+  lock_passwd: false
+write_files:
+- path: /etc/ssh/sshd_config.d/60-vps-provider-root.conf
+  owner: root:root
+  permissions: '0644'
+  content: |
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
+    UsePAM yes
+- path: /usr/local/sbin/vps-app-bootstrap
+  owner: root:root
+  permissions: '0700'
+  content: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    umask 077
+    export DEBIAN_FRONTEND=noninteractive
+    APP="10-chatwoot"
+    ROOT="/opt/vps-apps/$APP"
+    mkdir -p "$ROOT" /var/log/vps-apps
+    exec > >(tee -a "/var/log/vps-apps/$APP-bootstrap.log") 2>&1
+    trap 'echo "ERROR in $APP bootstrap at line $LINENO. Check /var/log/vps-apps/$APP-bootstrap.log" >&2' ERR
+    
+    assert_debian13() {
+      . /etc/os-release
+      if [[ "${ID:-}" != "debian" || "${VERSION_ID:-}" != "13" ]]; then
+        echo "This cloud-init file supports Debian 13 only." >&2; exit 1
+      fi
+      case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) echo 'Unsupported CPU architecture' >&2; exit 1;; esac
+    }
+    base_packages() {
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg openssl git jq unzip python3
+    }
+    install_docker() {
+      if docker compose version >/dev/null 2>&1; then systemctl enable --now docker; return; fi
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      chmod 0644 /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    Types: deb
+    URIs: https://download.docker.com/linux/debian
+    Suites: trixie
+    Components: stable
+    Architectures: $(dpkg --print-architecture)
+    Signed-By: /etc/apt/keyrings/docker.asc
+    EOF
+      apt-get update -qq
+      apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+      docker compose version
+    }
+    create_test_http() {
+      local port="$1" urlpath="${2:-/}" protocol="${3:-http}"
+      cat > /usr/local/sbin/vps-app-test <<EOF
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    echo 'Service: $APP'
+    echo 'Checking ${protocol}://127.0.0.1:${port}${urlpath}'
+    curl -k -sS -o /dev/null -w 'HTTP status: %{http_code}\n' --max-time 15 '${protocol}://127.0.0.1:${port}${urlpath}'
+    echo 'Container status:'
+    cd '$ROOT'
+    docker compose ps
+    EOF
+      chmod 0750 /usr/local/sbin/vps-app-test
+    }
+    assert_debian13
+    if [[ -f "$ROOT/.bootstrap-complete" ]]; then echo "$APP was provisioned already. Inspect $ROOT"; exit 0; fi
+    base_packages
+    
+    install_docker
+    
+    cd "$ROOT"
+    if [[ ! -f .env ]]; then
+      PUBLIC_IP="$(curl -fsS --max-time 5 https://ifconfig.me || true)"
+      [[ -n "$PUBLIC_IP" ]] || PUBLIC_IP="$(hostname -I | awk '{print $1}')"
+      cat >.env <<EOF
+    SECRET_KEY_BASE=$(openssl rand -hex 64)
+    POSTGRES_PASSWORD=$(openssl rand -hex 24)
+    REDIS_PASSWORD=$(openssl rand -hex 24)
+    FRONTEND_URL=http://${PUBLIC_IP}:3000
+    RAILS_ENV=production
+    NODE_ENV=production
+    INSTALLATION_ENV=docker
+    POSTGRES_HOST=postgres
+    POSTGRES_USERNAME=postgres
+    POSTGRES_DATABASE=chatwoot
+    ACTIVE_STORAGE_SERVICE=local
+    ENABLE_ACCOUNT_SIGNUP=true
+    EOF
+      chmod 0600 .env
+    fi
+    cat >compose.yaml <<'YAML'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        restart: unless-stopped
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: chatwoot
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+        volumes:
+          - postgres_data:/var/lib/postgresql/data
+        healthcheck:
+          test: ['CMD-SHELL', 'pg_isready -U postgres -d chatwoot']
+          interval: 10s
+          timeout: 5s
+          retries: 25
+      redis:
+        image: redis:7-alpine
+        restart: unless-stopped
+        environment:
+          REDIS_PASSWORD: ${REDIS_PASSWORD}
+        command: ['/bin/sh', '-c', 'exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"']
+        volumes:
+          - redis_data:/data
+        healthcheck:
+          test: ['CMD-SHELL', 'redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG']
+          interval: 10s
+          timeout: 5s
+          retries: 25
+      rails:
+        image: chatwoot/chatwoot:latest-ce
+        restart: unless-stopped
+        env_file: .env
+        environment:
+          REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+        depends_on:
+          postgres: {condition: service_healthy}
+          redis: {condition: service_healthy}
+        entrypoint: docker/entrypoints/rails.sh
+        command: ['bundle', 'exec', 'rails', 's', '-p', '3000', '-b', '0.0.0.0']
+        ports:
+          - '3000:3000'
+        volumes:
+          - storage_data:/app/storage
+      sidekiq:
+        image: chatwoot/chatwoot:latest-ce
+        restart: unless-stopped
+        env_file: .env
+        environment:
+          REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+        depends_on:
+          postgres: {condition: service_healthy}
+          redis: {condition: service_healthy}
+        command: ['bundle', 'exec', 'sidekiq', '-C', 'config/sidekiq.yml']
+        volumes:
+          - storage_data:/app/storage
+    volumes:
+      postgres_data:
+      redis_data:
+      storage_data:
+    YAML
+    docker compose config -q
+    docker compose up -d postgres redis
+    docker compose run --rm rails bundle exec rails db:chatwoot_prepare
+    docker compose up -d
+    create_test_http 3000 /api
+    
+    echo "Bootstrap complete."
+    touch "$ROOT/.bootstrap-complete"
+    echo "FINISHED: $APP (see $ROOT)"
+runcmd:
+- systemctl reload ssh || systemctl reload sshd || true
+- - bash
+  - /usr/local/sbin/vps-app-bootstrap

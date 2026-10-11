@@ -1,0 +1,16 @@
+# Environment and credentials
+.env
+.env.*
+*.key
+*.pem
+*.secret
+
+# Logs and generated temporary files
+*.log
+*.tmp
+*.bak
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

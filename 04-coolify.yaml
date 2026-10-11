@@ -1,0 +1,107 @@
+#cloud-config
+# Debian 13 (trixie) only. One fresh VPS per application.
+# Coolify official installer with staging firewall gate
+package_update: false
+disable_root: false
+ssh_pwauth: true
+# CUSTOMER: change root password below before production. Default is for lab/testing only.
+chpasswd:
+  expire: false
+  list: |
+    root:VpsApp-ChangeMe!
+users:
+- name: root
+  lock_passwd: false
+write_files:
+- path: /etc/ssh/sshd_config.d/60-vps-provider-root.conf
+  owner: root:root
+  permissions: '0644'
+  content: |
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
+    UsePAM yes
+- path: /usr/local/sbin/vps-app-bootstrap
+  owner: root:root
+  permissions: '0700'
+  content: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    umask 077
+    export DEBIAN_FRONTEND=noninteractive
+    APP="04-coolify"
+    ROOT="/opt/vps-apps/$APP"
+    mkdir -p "$ROOT" /var/log/vps-apps
+    exec > >(tee -a "/var/log/vps-apps/$APP-bootstrap.log") 2>&1
+    trap 'echo "ERROR in $APP bootstrap at line $LINENO. Check /var/log/vps-apps/$APP-bootstrap.log" >&2' ERR
+    
+    assert_debian13() {
+      . /etc/os-release
+      if [[ "${ID:-}" != "debian" || "${VERSION_ID:-}" != "13" ]]; then
+        echo "This cloud-init file supports Debian 13 only." >&2; exit 1
+      fi
+      case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) echo 'Unsupported CPU architecture' >&2; exit 1;; esac
+    }
+    base_packages() {
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg openssl git jq unzip python3
+    }
+    install_docker() {
+      if docker compose version >/dev/null 2>&1; then systemctl enable --now docker; return; fi
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      chmod 0644 /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    Types: deb
+    URIs: https://download.docker.com/linux/debian
+    Suites: trixie
+    Components: stable
+    Architectures: $(dpkg --print-architecture)
+    Signed-By: /etc/apt/keyrings/docker.asc
+    EOF
+      apt-get update -qq
+      apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+      docker compose version
+    }
+    create_test_http() {
+      local port="$1" urlpath="${2:-/}" protocol="${3:-http}"
+      cat > /usr/local/sbin/vps-app-test <<EOF
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    echo 'Service: $APP'
+    echo 'Checking ${protocol}://127.0.0.1:${port}${urlpath}'
+    curl -k -sS -o /dev/null -w 'HTTP status: %{http_code}\n' --max-time 15 '${protocol}://127.0.0.1:${port}${urlpath}'
+    echo 'Container status:'
+    cd '$ROOT'
+    docker compose ps
+    EOF
+      chmod 0750 /usr/local/sbin/vps-app-test
+    }
+    assert_debian13
+    if [[ -f "$ROOT/.bootstrap-complete" ]]; then echo "$APP was provisioned already. Inspect $ROOT"; exit 0; fi
+    base_packages
+    
+    install_docker
+    
+    # Coolify's installation script configures its own Docker services.
+    # Internet testing: admin ports left open (no DOCKER-USER DROP).
+    curl -fsSL --retry 3 https://cdn.coollabs.io/coolify/install.sh -o "$ROOT/official-install.sh"
+    chmod 0700 "$ROOT/official-install.sh"
+    bash "$ROOT/official-install.sh"
+    cat >/usr/local/sbin/vps-app-test <<'BASH'
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    systemctl is-active docker
+    curl -sS -o /dev/null -w 'Coolify HTTP status: %{http_code}\n' --max-time 15 http://127.0.0.1:8000/ || true
+    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    BASH
+    chmod 0750 /usr/local/sbin/vps-app-test
+    
+    echo "Bootstrap complete."
+    touch "$ROOT/.bootstrap-complete"
+    echo "FINISHED: $APP (see $ROOT)"
+runcmd:
+- systemctl reload ssh || systemctl reload sshd || true
+- - bash
+  - /usr/local/sbin/vps-app-bootstrap

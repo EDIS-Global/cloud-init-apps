@@ -1,0 +1,144 @@
+#cloud-config
+# Debian 13 (trixie) only. One fresh VPS per application.
+# Dify official multi-container Compose deployment
+package_update: false
+disable_root: false
+ssh_pwauth: true
+# CUSTOMER: change root password below before production. Default is for lab/testing only.
+chpasswd:
+  expire: false
+  list: |
+    root:VpsApp-ChangeMe!
+users:
+- name: root
+  lock_passwd: false
+write_files:
+- path: /etc/ssh/sshd_config.d/60-vps-provider-root.conf
+  owner: root:root
+  permissions: '0644'
+  content: |
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
+    UsePAM yes
+- path: /usr/local/sbin/vps-app-bootstrap
+  owner: root:root
+  permissions: '0700'
+  content: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    umask 077
+    export DEBIAN_FRONTEND=noninteractive
+    APP="11-dify"
+    ROOT="/opt/vps-apps/$APP"
+    mkdir -p "$ROOT" /var/log/vps-apps
+    exec > >(tee -a "/var/log/vps-apps/$APP-bootstrap.log") 2>&1
+    trap 'echo "ERROR in $APP bootstrap at line $LINENO. Check /var/log/vps-apps/$APP-bootstrap.log" >&2' ERR
+    
+    assert_debian13() {
+      . /etc/os-release
+      if [[ "${ID:-}" != "debian" || "${VERSION_ID:-}" != "13" ]]; then
+        echo "This cloud-init file supports Debian 13 only." >&2; exit 1
+      fi
+      case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) echo 'Unsupported CPU architecture' >&2; exit 1;; esac
+    }
+    base_packages() {
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg openssl git jq unzip python3
+    }
+    install_docker() {
+      if docker compose version >/dev/null 2>&1; then systemctl enable --now docker; return; fi
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      chmod 0644 /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    Types: deb
+    URIs: https://download.docker.com/linux/debian
+    Suites: trixie
+    Components: stable
+    Architectures: $(dpkg --print-architecture)
+    Signed-By: /etc/apt/keyrings/docker.asc
+    EOF
+      apt-get update -qq
+      apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+      docker compose version
+    }
+    create_test_http() {
+      local port="$1" urlpath="${2:-/}" protocol="${3:-http}"
+      cat > /usr/local/sbin/vps-app-test <<EOF
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    echo 'Service: $APP'
+    echo 'Checking ${protocol}://127.0.0.1:${port}${urlpath}'
+    curl -k -sS -o /dev/null -w 'HTTP status: %{http_code}\n' --max-time 15 '${protocol}://127.0.0.1:${port}${urlpath}'
+    echo 'Container status:'
+    cd '$ROOT'
+    docker compose ps
+    EOF
+      chmod 0750 /usr/local/sbin/vps-app-test
+    }
+    assert_debian13
+    if [[ -f "$ROOT/.bootstrap-complete" ]]; then echo "$APP was provisioned already. Inspect $ROOT"; exit 0; fi
+    base_packages
+    
+    install_docker
+    
+    cd "$ROOT"
+    if [[ ! -d source/.git ]]; then
+      RELEASE="$(curl -fsSL https://api.github.com/repos/langgenius/dify/releases/latest | jq -r '.tag_name // empty')"
+      [[ -n "$RELEASE" ]] || { echo 'Cannot determine Dify stable version'; exit 1; }
+      git clone --depth 1 --branch "$RELEASE" https://github.com/langgenius/dify.git source
+      echo "$RELEASE" > "$ROOT/UPSTREAM_RELEASE"
+    fi
+    cd "$ROOT/source/docker"
+    if [[ ! -f .env ]]; then
+      cp .env.example .env
+      python3 - <<'PY'
+    from pathlib import Path
+    import secrets, base64
+    p=Path('.env')
+    s=p.read_text()
+    r=lambda:secrets.token_hex(32)
+    db=r(); redis=r(); vector=r(); sandbox=r()
+    settings={
+      'SECRET_KEY':r(), 'DB_PASSWORD':db,
+      'REDIS_PASSWORD':redis, 'CELERY_BROKER_URL':f'redis://:{redis}@redis:6379/1',
+      'WEAVIATE_API_KEY':vector, 'WEAVIATE_AUTHENTICATION_APIKEY_ALLOWED_KEYS':vector,
+      'CODE_EXECUTION_API_KEY':sandbox, 'SANDBOX_API_KEY':sandbox,
+      'PLUGIN_DAEMON_KEY':r(), 'PLUGIN_DIFY_INNER_API_KEY':r(),
+      'DIFY_AGENT_API_TOKEN':r(),
+      'DIFY_AGENT_SERVER_SECRET_KEY':base64.b64encode(secrets.token_bytes(32)).decode(),
+      'EXPOSE_NGINX_PORT':'8080',
+      'EXPOSE_NGINX_SSL_PORT':'8443',
+    }
+    lines=[]
+    for line in s.splitlines():
+      key=line.split('=',1)[0]
+      if key in settings and not line.startswith('#'): line=f'{key}={settings[key]}'
+      lines.append(line)
+    found={ln.split('=',1)[0] for ln in lines if '=' in ln and not ln.startswith('#')}
+    for key,val in settings.items():
+      if key not in found: lines.append(f'{key}={val}')
+    p.write_text('\n'.join(lines)+'\n')
+    PY
+      chmod 0600 .env
+    fi
+    docker compose config -q
+    docker compose up -d
+    cat >/usr/local/sbin/vps-app-test <<'BASH'
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    cd /opt/vps-apps/11-dify/source/docker
+    docker compose ps
+    curl -sS --max-time 15 -o /dev/null -w 'Dify HTTP status: %{http_code}\n' http://127.0.0.1:8080/install
+    BASH
+    chmod 0750 /usr/local/sbin/vps-app-test
+    
+    echo "Bootstrap complete."
+    touch "$ROOT/.bootstrap-complete"
+    echo "FINISHED: $APP (see $ROOT)"
+runcmd:
+- systemctl reload ssh || systemctl reload sshd || true
+- - bash
+  - /usr/local/sbin/vps-app-bootstrap

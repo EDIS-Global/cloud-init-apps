@@ -1,0 +1,18 @@
+{
+  "os": "Debian 13",
+  "count": 12,
+  "templates": [
+    "01-n8n.yaml",
+    "03-wordpress.yaml",
+    "07-woocommerce.yaml",
+    "04-coolify.yaml",
+    "05-open-webui.yaml",
+    "06-hermes-agent.yaml",
+    "02-openclaw.yaml",
+    "08-ollama.yaml",
+    "09-portainer.yaml",
+    "10-chatwoot.yaml",
+    "11-dify.yaml",
+    "12-odoo.yaml"
+  ]
+}

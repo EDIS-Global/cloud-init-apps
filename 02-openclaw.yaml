@@ -1,0 +1,122 @@
+#cloud-config
+# Debian 13 (trixie) only. One fresh VPS per application.
+# OpenClaw: official Docker setup staged for interactive onboarding
+package_update: false
+disable_root: false
+ssh_pwauth: true
+# CUSTOMER: change root password below before production. Default is for lab/testing only.
+chpasswd:
+  expire: false
+  list: |
+    root:VpsApp-ChangeMe!
+users:
+- name: root
+  lock_passwd: false
+write_files:
+- path: /etc/ssh/sshd_config.d/60-vps-provider-root.conf
+  owner: root:root
+  permissions: '0644'
+  content: |
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
+    UsePAM yes
+- path: /usr/local/sbin/vps-app-bootstrap
+  owner: root:root
+  permissions: '0700'
+  content: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    umask 077
+    export DEBIAN_FRONTEND=noninteractive
+    APP="02-openclaw"
+    ROOT="/opt/vps-apps/$APP"
+    mkdir -p "$ROOT" /var/log/vps-apps
+    exec > >(tee -a "/var/log/vps-apps/$APP-bootstrap.log") 2>&1
+    trap 'echo "ERROR in $APP bootstrap at line $LINENO. Check /var/log/vps-apps/$APP-bootstrap.log" >&2' ERR
+    
+    assert_debian13() {
+      . /etc/os-release
+      if [[ "${ID:-}" != "debian" || "${VERSION_ID:-}" != "13" ]]; then
+        echo "This cloud-init file supports Debian 13 only." >&2; exit 1
+      fi
+      case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) echo 'Unsupported CPU architecture' >&2; exit 1;; esac
+    }
+    base_packages() {
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg openssl git jq unzip python3
+    }
+    install_docker() {
+      if docker compose version >/dev/null 2>&1; then systemctl enable --now docker; return; fi
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+      chmod 0644 /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    Types: deb
+    URIs: https://download.docker.com/linux/debian
+    Suites: trixie
+    Components: stable
+    Architectures: $(dpkg --print-architecture)
+    Signed-By: /etc/apt/keyrings/docker.asc
+    EOF
+      apt-get update -qq
+      apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+      docker compose version
+    }
+    create_test_http() {
+      local port="$1" urlpath="${2:-/}" protocol="${3:-http}"
+      cat > /usr/local/sbin/vps-app-test <<EOF
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    echo 'Service: $APP'
+    echo 'Checking ${protocol}://127.0.0.1:${port}${urlpath}'
+    curl -k -sS -o /dev/null -w 'HTTP status: %{http_code}\n' --max-time 15 '${protocol}://127.0.0.1:${port}${urlpath}'
+    echo 'Container status:'
+    cd '$ROOT'
+    docker compose ps
+    EOF
+      chmod 0750 /usr/local/sbin/vps-app-test
+    }
+    assert_debian13
+    if [[ -f "$ROOT/.bootstrap-complete" ]]; then echo "$APP was provisioned already. Inspect $ROOT"; exit 0; fi
+    base_packages
+    
+    install_docker
+    
+    # Internet testing: gateway port left open after openclaw-setup (no DOCKER-USER DROP).
+    mkdir -p "$ROOT/config" "$ROOT/workspace" "$ROOT/auth-profile-secrets"
+    if [[ ! -d "$ROOT/source/.git" ]]; then
+      git clone --depth 1 --branch 2026.9.3 https://github.com/openclaw/openclaw.git "$ROOT/source"
+    fi
+    docker pull ghcr.io/openclaw/openclaw:2026.9.3
+    cat >/usr/local/sbin/openclaw-setup <<'BASH'
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    cd /opt/vps-apps/02-openclaw/source
+    export OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.9.3
+    export OPENCLAW_CONFIG_DIR=/opt/vps-apps/02-openclaw/config
+    export OPENCLAW_WORKSPACE_DIR=/opt/vps-apps/02-openclaw/workspace
+    export OPENCLAW_AUTH_PROFILE_SECRET_DIR=/opt/vps-apps/02-openclaw/auth-profile-secrets
+    ./scripts/docker/setup.sh
+    BASH
+    chmod 0750 /usr/local/sbin/openclaw-setup
+    cat >/usr/local/sbin/vps-app-test <<'BASH'
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    docker image inspect ghcr.io/openclaw/openclaw:2026.9.3 >/dev/null
+    if docker ps --format '{{.Names}}' | grep -q openclaw; then
+      docker ps --filter name=openclaw
+    else
+      echo 'Image staged; run sudo openclaw-setup interactively to configure model and start gateway.'
+    fi
+    BASH
+    chmod 0750 /usr/local/sbin/vps-app-test
+    
+    echo "Staged, NOT RUNNING: run sudo openclaw-setup interactively over SSH"
+    touch "$ROOT/.bootstrap-complete"
+    echo "FINISHED: $APP (see $ROOT)"
+runcmd:
+- systemctl reload ssh || systemctl reload sshd || true
+- - bash
+  - /usr/local/sbin/vps-app-bootstrap
